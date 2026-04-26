@@ -267,7 +267,8 @@ Hard rules:
 - **0.2 — shipped.** GitHub OAuth device-flow + Gist publish (`--publish=gist`), `republish` subcommand, encrypted GH token storage. Same passphrase secures both the device key and the GH OAuth token.
 - **0.2.1 — shipped.** ES256 (ECDSA P-256) replaces EdDSA (Infisical/Vault/AWS-STS rejected EdDSA). New `--publish=repo` mode: GitHub public repo + raw URLs, works with strict OIDC verifiers that auto-append `/.well-known/openid-configuration`.
 - **0.3 — shipped (Windows only).** Tier 1 hardware via TPM 2.0 / TBS. Auto-detected at init. Key generated and used inside the chip — never materialized in RAM. `device_id` derived from key thumbprint = stable across restarts. Linux TPM 2.0 + macOS Secure Enclave deferred.
-- **0.4** — Tier 3 (KMS-wrapped), posture claims, headless `--register-token` for VPS bootstrap, OS keyring for OAuth token storage (so TPM tier can republish without re-OAuth).
+- **0.4 — shipped.** Hardening pass: Host header allowlist (kills DNS rebinding), Origin reject (kills browser CSRF), `--allowed-audiences` filter, `--rate-limit` token-bucket cap, JSON audit log to stdout (every mint), `govulncheck` in CI.
+- **0.5** — Process attribution (peer process owner check), Linux TPM 2.0, OS keyring for OAuth token storage (so TPM tier can republish), Windows ACL hardening on state dir.
 - **0.5** — Hosted registry (`registry.tapid.dev`) opt-in, multi-device per user, admin CLI, JWKS rotation with dual-key overlap window.
 - **0.6** — RFC 8693 token exchange, audit log streaming, MDM hooks (Jamf/Intune/Kandji), JWKS transparency log.
 

@@ -100,6 +100,9 @@ Init flags:
 Serve flags:
   --addr <host:port>          bind address (default: 127.0.0.1:53682)
   --max-ttl <seconds>         max JWT lifetime (default: 3600)
+  --allowed-audiences <csv>   restrict mint to these audiences (default: any)
+                              e.g. "infisical,vault,tap"
+  --rate-limit <per-sec>      cap mints/second (default: 0 = unlimited)
 
 Env:
   TAPID_PASSPHRASE            passphrase (overrides file/TTY)
@@ -461,6 +464,8 @@ func runServe(args []string) {
 	stateDir := fs.String("state-dir", defaultStateDir(), "where device key + metadata live")
 	maxTTL := fs.Int("max-ttl", 3600, "max JWT lifetime in seconds")
 	passFile := fs.String("passphrase-file", "", "read passphrase from file")
+	allowedAud := fs.String("allowed-audiences", "", "csv of allowed audience strings (default: any)")
+	rateLimit := fs.Int("rate-limit", 0, "cap mints/second (default: 0 = unlimited)")
 	_ = fs.Parse(args)
 
 	dev, err := state.Load(*stateDir)
@@ -492,11 +497,23 @@ func runServe(args []string) {
 		log.Fatalf("serve: unknown key_tier %q in device.json", dev.KeyTier)
 	}
 
+	var auds []string
+	if *allowedAud != "" {
+		for _, a := range strings.Split(*allowedAud, ",") {
+			a = strings.TrimSpace(a)
+			if a != "" {
+				auds = append(auds, a)
+			}
+		}
+	}
+
 	cfg := server.Config{
-		Addr:   *addr,
-		MaxTTL: *maxTTL,
-		Device: dev,
-		Signer: store,
+		Addr:             *addr,
+		MaxTTL:           *maxTTL,
+		Device:           dev,
+		Signer:           store,
+		AllowedAudiences: auds,
+		RateLimitPerSec:  *rateLimit,
 	}
 	if err := server.Run(cfg); err != nil {
 		log.Fatal(err)
