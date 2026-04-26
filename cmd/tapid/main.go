@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,7 +23,13 @@ import (
 
 const version = "0.2.0-dev"
 
-const githubScopes = "gist"
+const (
+	githubScopesGist = "gist"
+	githubScopesRepo = "public_repo"
+
+	defaultRepoName   = "tapid-jwks"
+	defaultRepoBranch = "main"
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -63,12 +70,22 @@ Common flags:
   --passphrase-file <path>    read passphrase from file (no TTY prompt)
 
 Init flags:
-  --publish=manual|gist       publishing mode (default: manual)
-  --issuer-url <url>          (manual mode) fully-qualified issuer URL
-  --publish-dir <path>        (manual mode) where to write JWKS + discovery
+  --publish=manual|gist|repo  publishing mode (default: manual)
+                              repo = GitHub public repo + raw URLs
+                                     (works with strict OIDC verifiers
+                                     like Infisical, Vault, AWS STS)
+                              gist = GitHub gist
+                                     (only works with verifiers that take
+                                     arbitrary Discovery URLs — most don't)
+                              manual = you upload the publish dir yourself
+  --issuer-url <url>          (manual) fully-qualified issuer URL
+  --publish-dir <path>        (manual) where to write JWKS + discovery
                               (default: <state-dir>/publish)
-  --github-client-id <id>     (gist mode) OAuth App client ID
+  --github-client-id <id>     (gist|repo) OAuth App client ID
                               (or env TAPID_GITHUB_CLIENT_ID)
+  --repo-name <name>          (repo) repo to create/use on your GitHub
+                              account (default: tapid-jwks)
+  --repo-branch <branch>      (repo) branch to commit to (default: main)
 
 Serve flags:
   --addr <host:port>          bind address (default: 127.0.0.1:53682)
@@ -87,10 +104,12 @@ See SPEC.md for design.
 func runInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	stateDir := fs.String("state-dir", defaultStateDir(), "where device key + metadata live")
-	publishMode := fs.String("publish", "manual", "manual|gist")
+	publishMode := fs.String("publish", "manual", "manual|gist|repo")
 	issuerURL := fs.String("issuer-url", "", "(manual) fully-qualified issuer URL")
 	publishDir := fs.String("publish-dir", "", "(manual) where to write JWKS + discovery")
-	clientID := fs.String("github-client-id", os.Getenv("TAPID_GITHUB_CLIENT_ID"), "(gist) OAuth App client ID")
+	clientID := fs.String("github-client-id", os.Getenv("TAPID_GITHUB_CLIENT_ID"), "(gist|repo) OAuth App client ID")
+	repoName := fs.String("repo-name", defaultRepoName, "(repo) repo name on your GitHub account")
+	repoBranch := fs.String("repo-branch", defaultRepoBranch, "(repo) branch to commit to")
 	passFile := fs.String("passphrase-file", "", "read passphrase from file")
 	_ = fs.Parse(args)
 
@@ -140,13 +159,26 @@ func runInit(args []string) {
 		if *clientID == "" {
 			log.Fatal("init: --github-client-id (or TAPID_GITHUB_CLIENT_ID) required for gist mode")
 		}
+		fmt.Fprintln(os.Stderr,
+			"WARNING: gist mode does not work with strict OIDC verifiers (Infisical, Vault, AWS STS)\n"+
+				"         that append /.well-known/openid-configuration to the Discovery URL.\n"+
+				"         Use --publish=repo for those.")
 		if err := initGist(*stateDir, &dev, store, *clientID, pass); err != nil {
 			log.Fatalf("init: gist: %v", err)
 		}
 		printSummaryGist(dev, *stateDir)
 
+	case "repo":
+		if *clientID == "" {
+			log.Fatal("init: --github-client-id (or TAPID_GITHUB_CLIENT_ID) required for repo mode")
+		}
+		if err := initRepo(*stateDir, &dev, store, *clientID, *repoName, *repoBranch, pass); err != nil {
+			log.Fatalf("init: repo: %v", err)
+		}
+		printSummaryRepo(dev, *stateDir)
+
 	default:
-		log.Fatalf("init: unknown --publish mode %q (use manual or gist)", *publishMode)
+		log.Fatalf("init: unknown --publish mode %q (use manual, gist, or repo)", *publishMode)
 	}
 
 	if err := dev.Save(*stateDir); err != nil {
@@ -161,7 +193,7 @@ func initGist(stateDir string, dev *state.Device, store keystore.Store, clientID
 	defer cancel()
 
 	fmt.Fprintln(os.Stderr, "→ requesting GitHub device code…")
-	dc, err := github.StartDeviceFlow(ctx, clientID, githubScopes)
+	dc, err := github.StartDeviceFlow(ctx, clientID, githubScopesGist)
 	if err != nil {
 		return fmt.Errorf("device-flow start: %w", err)
 	}
@@ -205,7 +237,7 @@ func initGist(stateDir string, dev *state.Device, store keystore.Store, clientID
 	if err != nil {
 		return err
 	}
-	set, err := encodeJSON(jwks.FromEd25519(store.PublicKey(), dev.Kid))
+	set, err := encodeJSON(mustJWKS(store.PublicKey(), dev.Kid))
 	if err != nil {
 		return err
 	}
@@ -226,6 +258,79 @@ func initGist(stateDir string, dev *state.Device, store keystore.Store, clientID
 	return nil
 }
 
+// ---- repo init flow --------------------------------------------------------
+
+func initRepo(stateDir string, dev *state.Device, store keystore.Store, clientID, repoName, repoBranch string, pass []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	fmt.Fprintln(os.Stderr, "→ requesting GitHub device code…")
+	dc, err := github.StartDeviceFlow(ctx, clientID, githubScopesRepo)
+	if err != nil {
+		return fmt.Errorf("device-flow start: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "\n  Open: %s\n  Code: %s\n  (expires in %d s)\n\n",
+		dc.VerificationURI, dc.UserCode, dc.ExpiresIn)
+	cli.OpenBrowser(dc.VerificationURI)
+
+	fmt.Fprintln(os.Stderr, "→ waiting for you to approve in the browser…")
+	tok, err := github.PollForToken(ctx, clientID, dc)
+	if err != nil {
+		return fmt.Errorf("device-flow poll: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "✓ authorized")
+
+	fmt.Fprintln(os.Stderr, "→ resolving GitHub user…")
+	user, err := github.GetUser(ctx, tok.AccessToken)
+	if err != nil {
+		return fmt.Errorf("get user: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "→ ensuring repo %s/%s exists…\n", user.Login, repoName)
+	repo, err := github.EnsureRepo(ctx, tok.AccessToken, user.Login, repoName)
+	if err != nil {
+		return fmt.Errorf("ensure repo: %w", err)
+	}
+	if repo.Private {
+		return fmt.Errorf("repo %s/%s is private; raw URLs require it to be public", user.Login, repoName)
+	}
+	branch := repoBranch
+	if repo.DefaultBranch != "" && branch == defaultRepoBranch {
+		branch = repo.DefaultBranch
+	}
+
+	dev.PublishMode = "repo"
+	dev.RepoOwner = user.Login
+	dev.RepoName = repo.Name
+	dev.RepoBranch = branch
+	dev.IssuerURL = github.IssuerBaseURL(user.Login, repo.Name, branch, dev.DeviceID)
+
+	disc, err := encodeJSON(jwks.Discovery(dev.IssuerURL))
+	if err != nil {
+		return err
+	}
+	set, err := encodeJSON(mustJWKS(store.PublicKey(), dev.Kid))
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stderr, "→ pushing discovery + JWKS…")
+	discPath := fmt.Sprintf("devices/%s/.well-known/openid-configuration", dev.DeviceID)
+	jwksPath := fmt.Sprintf("devices/%s/jwks.json", dev.DeviceID)
+	commitMsg := fmt.Sprintf("tapid: publish JWKS for device %s", dev.DeviceID)
+	if err := github.PutFile(ctx, tok.AccessToken, user.Login, repo.Name, branch, discPath, disc, commitMsg); err != nil {
+		return fmt.Errorf("put discovery: %w", err)
+	}
+	if err := github.PutFile(ctx, tok.AccessToken, user.Login, repo.Name, branch, jwksPath, set, commitMsg); err != nil {
+		return fmt.Errorf("put jwks: %w", err)
+	}
+
+	if err := keystore.SealSecret(state.GitHubTokenPath(stateDir), []byte(tok.AccessToken), pass); err != nil {
+		return fmt.Errorf("seal github token: %w", err)
+	}
+	return nil
+}
+
 // ---- republish -------------------------------------------------------------
 
 func runRepublish(args []string) {
@@ -238,8 +343,8 @@ func runRepublish(args []string) {
 	if err != nil {
 		log.Fatalf("republish: load device: %v", err)
 	}
-	if dev.PublishMode != "gist" {
-		log.Fatalf("republish: device is in %q mode; only gist mode is republishable", dev.PublishMode)
+	if dev.PublishMode != "gist" && dev.PublishMode != "repo" {
+		log.Fatalf("republish: device is in %q mode; only gist or repo modes are republishable", dev.PublishMode)
 	}
 
 	pass, err := readPassphrase(*passFile, false)
@@ -257,23 +362,44 @@ func runRepublish(args []string) {
 		log.Fatalf("republish: open token: %v", err)
 	}
 
-	disc, err := encodeJSON(jwks.Discovery(dev.IssuerURL).WithJWKS(
-		github.RawURL(dev.GistOwner, dev.GistID, dev.GistFileJWKS)))
-	if err != nil {
-		log.Fatal(err)
-	}
-	set, err := encodeJSON(jwks.FromEd25519(store.PublicKey(), dev.Kid))
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := github.UpdateGist(ctx, string(tokenBytes), dev.GistID, map[string]string{
-		dev.GistFileDiscovery: disc,
-		dev.GistFileJWKS:      set,
-	}); err != nil {
-		log.Fatalf("republish: %v", err)
+
+	switch dev.PublishMode {
+	case "gist":
+		disc, err := encodeJSON(jwks.Discovery(dev.IssuerURL).WithJWKS(
+			github.RawURL(dev.GistOwner, dev.GistID, dev.GistFileJWKS)))
+		if err != nil {
+			log.Fatal(err)
+		}
+		set, err := encodeJSON(mustJWKS(store.PublicKey(), dev.Kid))
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, err := github.UpdateGist(ctx, string(tokenBytes), dev.GistID, map[string]string{
+			dev.GistFileDiscovery: disc,
+			dev.GistFileJWKS:      set,
+		}); err != nil {
+			log.Fatalf("republish: %v", err)
+		}
+	case "repo":
+		disc, err := encodeJSON(jwks.Discovery(dev.IssuerURL))
+		if err != nil {
+			log.Fatal(err)
+		}
+		set, err := encodeJSON(mustJWKS(store.PublicKey(), dev.Kid))
+		if err != nil {
+			log.Fatal(err)
+		}
+		discPath := fmt.Sprintf("devices/%s/.well-known/openid-configuration", dev.DeviceID)
+		jwksPath := fmt.Sprintf("devices/%s/jwks.json", dev.DeviceID)
+		commitMsg := fmt.Sprintf("tapid: republish JWKS for device %s", dev.DeviceID)
+		if err := github.PutFile(ctx, string(tokenBytes), dev.RepoOwner, dev.RepoName, dev.RepoBranch, discPath, disc, commitMsg); err != nil {
+			log.Fatalf("republish discovery: %v", err)
+		}
+		if err := github.PutFile(ctx, string(tokenBytes), dev.RepoOwner, dev.RepoName, dev.RepoBranch, jwksPath, set, commitMsg); err != nil {
+			log.Fatalf("republish jwks: %v", err)
+		}
 	}
 	fmt.Println("republished:", dev.IssuerURL)
 }
@@ -324,7 +450,7 @@ func writePublishDir(dir string, dev state.Device, store keystore.Store) error {
 	if err := writeJSONFile(filepath.Join(dir, ".well-known", "openid-configuration"), disc); err != nil {
 		return err
 	}
-	set := jwks.FromEd25519(store.PublicKey(), dev.Kid)
+	set := mustJWKS(store.PublicKey(), dev.Kid)
 	return writeJSONFile(filepath.Join(dir, "jwks.json"), set)
 }
 
@@ -360,6 +486,24 @@ func printSummaryManual(dev state.Device, stateDir, pub string) {
 	fmt.Printf("  2. Run:  tapid serve\n")
 }
 
+func printSummaryRepo(dev state.Device, stateDir string) {
+	fmt.Printf("\nDevice initialized (repo publish).\n")
+	fmt.Printf("  device_id  : %s\n", dev.DeviceID)
+	fmt.Printf("  kid        : %s\n", dev.Kid)
+	fmt.Printf("  repo       : %s/%s (branch %s)\n", dev.RepoOwner, dev.RepoName, dev.RepoBranch)
+	fmt.Printf("  issuer URL : %s\n", dev.IssuerURL)
+	fmt.Printf("  discovery  : %s/.well-known/openid-configuration\n", dev.IssuerURL)
+	fmt.Printf("  jwks       : %s/jwks.json\n", dev.IssuerURL)
+	fmt.Printf("  state dir  : %s\n\n", stateDir)
+	fmt.Printf("Configure your relying party (Infisical, Vault, AWS STS) with:\n")
+	fmt.Printf("  Discovery URL = %s\n", dev.IssuerURL)
+	fmt.Printf("  Issuer        = %s\n", dev.IssuerURL)
+	fmt.Printf("  Subject       = device:%s\n\n", dev.DeviceID)
+	fmt.Printf("Note: GitHub raw caches ~5 min — first verifier fetch may pause.\n\n")
+	fmt.Printf("Then:\n")
+	fmt.Printf("  tapid serve\n")
+}
+
 func printSummaryGist(dev state.Device, stateDir string) {
 	fmt.Printf("\nDevice initialized (gist publish).\n")
 	fmt.Printf("  device_id  : %s\n", dev.DeviceID)
@@ -375,6 +519,16 @@ func printSummaryGist(dev state.Device, stateDir string) {
 	fmt.Printf("  Subject       = device:%s\n\n", dev.DeviceID)
 	fmt.Printf("Then:\n")
 	fmt.Printf("  tapid serve\n")
+}
+
+// mustJWKS panics if the public key isn't a supported type. Used at points
+// where we just generated the key ourselves and any failure is a bug.
+func mustJWKS(pub crypto.PublicKey, kid string) jwks.Set {
+	set, err := jwks.FromPublicKey(pub, kid)
+	if err != nil {
+		panic(fmt.Sprintf("jwks build: %v", err))
+	}
+	return set
 }
 
 func defaultStateDir() string {

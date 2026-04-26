@@ -34,7 +34,7 @@ func Sign(claims any, kid string, signer keystore.Store) (string, error) {
 		return "", errors.New("jwt: empty kid")
 	}
 
-	hdrJSON, err := json.Marshal(Header{Alg: "EdDSA", Typ: "JWT", Kid: kid})
+	hdrJSON, err := json.Marshal(Header{Alg: signer.Alg(), Typ: "JWT", Kid: kid})
 	if err != nil {
 		return "", fmt.Errorf("jwt: marshal header: %w", err)
 	}

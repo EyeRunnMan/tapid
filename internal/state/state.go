@@ -22,8 +22,11 @@ type Device struct {
 	KeyTier   string    `json:"key_tier"`
 	CreatedAt time.Time `json:"created_at"`
 
-	// Publish mode: "manual" (user uploads JWKS) or "gist" (tapid manages a
-	// GitHub Gist). Empty = "manual" for backward compatibility.
+	// Publish mode: "manual" (user uploads JWKS), "gist" (GitHub gist; works
+	// only with verifiers that accept arbitrary discovery URLs), or "repo"
+	// (GitHub public repo + raw URLs; works with strict OIDC verifiers that
+	// append /.well-known/openid-configuration). Empty = "manual" for
+	// backward compatibility.
 	PublishMode string `json:"publish_mode,omitempty"`
 
 	// Populated only when PublishMode == "gist".
@@ -31,6 +34,11 @@ type Device struct {
 	GistOwner         string `json:"gist_owner,omitempty"`
 	GistFileJWKS      string `json:"gist_file_jwks,omitempty"`
 	GistFileDiscovery string `json:"gist_file_discovery,omitempty"`
+
+	// Populated only when PublishMode == "repo".
+	RepoOwner  string `json:"repo_owner,omitempty"`
+	RepoName   string `json:"repo_name,omitempty"`
+	RepoBranch string `json:"repo_branch,omitempty"`
 }
 
 const (

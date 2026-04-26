@@ -60,7 +60,16 @@ func handleDiscovery(cfg Config) http.HandlerFunc {
 }
 
 func handleJWKS(cfg Config) http.HandlerFunc {
-	set := jwks.FromEd25519(cfg.Signer.PublicKey(), cfg.Device.Kid)
+	set, err := jwks.FromPublicKey(cfg.Signer.PublicKey(), cfg.Device.Kid)
+	if err != nil {
+		// Build error is unrecoverable — daemon shouldn't have started.
+		// Return a closure that 500s consistently so the operator notices.
+		return func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "jwks_build_failed", "detail": err.Error(),
+			})
+		}
+	}
 	return func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, set)
 	}

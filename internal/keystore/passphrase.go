@@ -1,10 +1,14 @@
 package keystore
 
 import (
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/ed25519"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -20,78 +24,102 @@ import (
 //   offset  size  field
 //   ------  ----  -------------------------------------------
 //   0       4     magic "TPKE"  (tapid passphrase key envelope)
-//   4       1     version (currently 1)
+//   4       1     version (currently 2)
 //   5       1     reserved (0)
-//   6       4     scrypt N (uint32 BE) — log2 cost factor stored as exponent
+//   6       4     scrypt N (uint32 BE)
 //   10      4     scrypt r (uint32 BE)
 //   14      4     scrypt p (uint32 BE)
 //   18      16    salt
 //   34      12    AES-GCM nonce
-//   46      ...   ciphertext (32-byte ed25519 seed) || GCM tag
+//   46      ...   ciphertext (PKCS8-encoded ECDSA P-256 private key) || GCM tag
 //
-// Everything after the magic is authenticated by GCM (file header used as AAD).
+// Header (everything before ciphertext) is authenticated by GCM as AAD.
 
 const (
 	pphMagic   = "TPKE"
-	pphVersion = 1
+	pphVersion = 2
 
 	scryptN = 1 << 16 // 65536
 	scryptR = 8
 	scryptP = 1
 	keyLen  = 32
 
-	saltLen  = 16
-	nonceLen = 12
+	saltLen   = 16
+	nonceLen  = 12
 	headerLen = 4 + 1 + 1 + 4 + 4 + 4 + saltLen + nonceLen // 46
 )
 
-// PassphraseStore is a tier-4 keystore backed by a scrypt+AES-GCM file.
+// PassphraseStore is a tier-4 keystore backed by scrypt+AES-GCM around an
+// ECDSA P-256 private key. Alg = ES256.
 type PassphraseStore struct {
-	priv ed25519.PrivateKey
-	pub  ed25519.PublicKey
+	priv *ecdsa.PrivateKey
 }
 
-func (s *PassphraseStore) Tier() Tier               { return TierPassphrase }
-func (s *PassphraseStore) PublicKey() ed25519.PublicKey { return s.pub }
+func (s *PassphraseStore) Tier() Tier                 { return TierPassphrase }
+func (s *PassphraseStore) Alg() string                { return "ES256" }
+func (s *PassphraseStore) PublicKey() crypto.PublicKey { return &s.priv.PublicKey }
 
+// Sign hashes msg with SHA-256, signs with ECDSA P-256, and returns the
+// JWS-compact signature: r||s as fixed-width 32+32 = 64 bytes (NOT ASN.1 DER),
+// per RFC 7515 §A.3.
 func (s *PassphraseStore) Sign(msg []byte) ([]byte, error) {
-	if len(s.priv) == 0 {
+	if s.priv == nil {
 		return nil, errors.New("keystore: not initialized")
 	}
-	return ed25519.Sign(s.priv, msg), nil
+	hash := sha256.Sum256(msg)
+	r, ss, err := ecdsa.Sign(rand.Reader, s.priv, hash[:])
+	if err != nil {
+		return nil, fmt.Errorf("keystore: ecdsa sign: %w", err)
+	}
+	out := make([]byte, 64)
+	rBytes := r.Bytes()
+	sBytes := ss.Bytes()
+	copy(out[32-len(rBytes):32], rBytes)
+	copy(out[64-len(sBytes):64], sBytes)
+	return out, nil
 }
 
-// GeneratePassphrase creates a fresh Ed25519 keypair, encrypts the seed under
-// passphrase via scrypt+AES-GCM, and writes the sealed file at path.
-// Returns the resulting store ready to use.
+// GeneratePassphrase creates a fresh P-256 keypair, marshals it to PKCS8,
+// encrypts under passphrase, and writes the sealed file at path.
 func GeneratePassphrase(path string, passphrase []byte) (*PassphraseStore, error) {
 	if len(passphrase) < 8 {
 		return nil, errors.New("keystore: passphrase must be ≥8 bytes")
 	}
-
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("keystore: generate ed25519: %w", err)
+		return nil, fmt.Errorf("keystore: generate p256: %w", err)
 	}
-	seed := priv.Seed() // 32 bytes; deterministic regen via NewKeyFromSeed
-
-	if err := writeSealed(path, seed, passphrase); err != nil {
+	blob, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("keystore: pkcs8 marshal: %w", err)
+	}
+	if err := writeSealed(path, blob, passphrase); err != nil {
 		return nil, err
 	}
-	return &PassphraseStore{priv: priv, pub: pub}, nil
+	return &PassphraseStore{priv: priv}, nil
 }
 
-// OpenPassphrase decrypts the sealed file at path and returns the store.
+// OpenPassphrase decrypts the sealed file and parses the PKCS8 P-256 key.
 func OpenPassphrase(path string, passphrase []byte) (*PassphraseStore, error) {
-	seed, err := readSealed(path, passphrase)
+	blob, err := readSealed(path, passphrase)
 	if err != nil {
 		return nil, err
 	}
-	priv := ed25519.NewKeyFromSeed(seed)
-	return &PassphraseStore{priv: priv, pub: priv.Public().(ed25519.PublicKey)}, nil
+	parsed, err := x509.ParsePKCS8PrivateKey(blob)
+	if err != nil {
+		return nil, fmt.Errorf("keystore: pkcs8 parse: %w", err)
+	}
+	priv, ok := parsed.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("keystore: unexpected key type %T (want *ecdsa.PrivateKey)", parsed)
+	}
+	if priv.Curve != elliptic.P256() {
+		return nil, errors.New("keystore: key is not on P-256")
+	}
+	return &PassphraseStore{priv: priv}, nil
 }
 
-func writeSealed(path string, seed, passphrase []byte) error {
+func writeSealed(path string, plaintext, passphrase []byte) error {
 	salt := make([]byte, saltLen)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return fmt.Errorf("keystore: read salt: %w", err)
@@ -116,7 +144,7 @@ func writeSealed(path string, seed, passphrase []byte) error {
 	if err != nil {
 		return fmt.Errorf("keystore: gcm: %w", err)
 	}
-	ct := aead.Seal(nil, nonce, seed, header)
+	ct := aead.Seal(nil, nonce, plaintext, header)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("keystore: mkdir: %w", err)
@@ -125,11 +153,7 @@ func writeSealed(path string, seed, passphrase []byte) error {
 	out := make([]byte, 0, len(header)+len(ct))
 	out = append(out, header...)
 	out = append(out, ct...)
-
-	if err := writeFile0600(path, out); err != nil {
-		return fmt.Errorf("keystore: write: %w", err)
-	}
-	return nil
+	return writeFile0600(path, out)
 }
 
 func readSealed(path string, passphrase []byte) ([]byte, error) {
@@ -146,7 +170,7 @@ func readSealed(path string, passphrase []byte) ([]byte, error) {
 		return nil, errors.New("keystore: bad magic (not a tapid sealed file)")
 	}
 	if header[4] != pphVersion {
-		return nil, fmt.Errorf("keystore: unsupported version %d", header[4])
+		return nil, fmt.Errorf("keystore: unsupported version %d (expected %d)", header[4], pphVersion)
 	}
 
 	N := int(binary.BigEndian.Uint32(header[6:10]))
@@ -168,14 +192,11 @@ func readSealed(path string, passphrase []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("keystore: gcm: %w", err)
 	}
-	seed, err := aead.Open(nil, nonce, ct, header)
+	pt, err := aead.Open(nil, nonce, ct, header)
 	if err != nil {
 		return nil, errors.New("keystore: decrypt failed (wrong passphrase or corrupt file)")
 	}
-	if len(seed) != ed25519.SeedSize {
-		return nil, fmt.Errorf("keystore: unexpected seed length %d", len(seed))
-	}
-	return seed, nil
+	return pt, nil
 }
 
 func buildHeader(salt, nonce []byte) []byte {
