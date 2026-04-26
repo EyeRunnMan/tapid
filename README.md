@@ -33,11 +33,6 @@ Pin a specific version: `TAPID_VERSION=v0.3.0 curl …`.
 ### Mode A — GitHub repo publish (works with strict OIDC verifiers like Infisical)
 
 ```bash
-# one-time: register an OAuth App on GitHub with the "gist" + "public_repo" scopes,
-# enable Device Flow, and copy the Client ID.
-
-export TAPID_GITHUB_CLIENT_ID=Iv1.xxxxxxxx
-
 tapid init --publish=repo
 # → opens browser, you approve
 # → creates <you>/tapid-jwks repo, pushes your JWKS
@@ -69,6 +64,20 @@ tapid serve
 | 4 | passphrase-encrypted file (scrypt + AES-GCM) | shipped | with passphrase |
 
 ES256 (ECDSA P-256) — universally supported by OIDC backends.
+
+### GitHub OAuth App
+
+`--publish=gist` and `--publish=repo` use a bundled OAuth App named **tapid** owned by [@EyeRunnMan](https://github.com/EyeRunnMan). When you `tapid init`, you'll be asked to authorize it on GitHub (device flow). Tokens are issued by GitHub directly to your account; tapid stores nothing about you.
+
+To use your own OAuth App instead (for orgs that prefer self-owned trust):
+
+```bash
+TAPID_GITHUB_CLIENT_ID=Iv23xxxxxxxx tapid init --publish=repo
+# or
+tapid init --publish=repo --github-client-id=Iv23xxxxxxxx
+```
+
+Register your OAuth App at https://github.com/settings/developers with **Device Flow enabled** and the `gist` + `public_repo` scopes.
 
 ## Why
 

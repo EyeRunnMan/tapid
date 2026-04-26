@@ -61,19 +61,20 @@ jobs:
       - name: package
         id: pkg
         run: |
+          set -euo pipefail
           VER="${GITHUB_REF_NAME}"
           NAME="tapid_${VER}_${{ matrix.os }}_${{ matrix.arch }}"
+          cp LICENSE README.md dist/
           cd dist
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            mv "tapid${{ matrix.ext }}" "tapid${{ matrix.ext }}"
-            zip "${NAME}.zip" "tapid${{ matrix.ext }}" ../LICENSE ../README.md
-            echo "asset=${NAME}.zip" >> "$GITHUB_OUTPUT"
+            zip "${NAME}.zip" "tapid${{ matrix.ext }}" LICENSE README.md
             sha256sum "${NAME}.zip" > "${NAME}.zip.sha256"
+            echo "asset=${NAME}.zip" >> "$GITHUB_OUTPUT"
             echo "sha=${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
           else
-            tar -czf "${NAME}.tar.gz" "tapid${{ matrix.ext }}" -C .. LICENSE README.md
-            echo "asset=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+            tar -czf "${NAME}.tar.gz" "tapid${{ matrix.ext }}" LICENSE README.md
             sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+            echo "asset=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
             echo "sha=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           fi
 

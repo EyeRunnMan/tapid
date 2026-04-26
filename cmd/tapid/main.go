@@ -29,6 +29,12 @@ const (
 
 	defaultRepoName   = "tapid-jwks"
 	defaultRepoBranch = "main"
+
+	// defaultGitHubClientID is the OAuth App tapid uses for device-flow auth.
+	// It's an EyeRunnMan-owned "tapid" OAuth App with Device Flow enabled.
+	// Tokens are issued by GitHub directly to the user; we never see them.
+	// Override with --github-client-id or TAPID_GITHUB_CLIENT_ID for self-hosted apps.
+	defaultGitHubClientID = "Ov23liFCcCdx4Ed8vvpo"
 )
 
 func main() {
@@ -111,7 +117,7 @@ func runInit(args []string) {
 	publishMode := fs.String("publish", "manual", "manual|gist|repo")
 	issuerURL := fs.String("issuer-url", "", "(manual) fully-qualified issuer URL")
 	publishDir := fs.String("publish-dir", "", "(manual) where to write JWKS + discovery")
-	clientID := fs.String("github-client-id", os.Getenv("TAPID_GITHUB_CLIENT_ID"), "(gist|repo) OAuth App client ID")
+	clientID := fs.String("github-client-id", clientIDDefault(), "(gist|repo) OAuth App client ID (default: bundled tapid app)")
 	repoName := fs.String("repo-name", defaultRepoName, "(repo) repo name on your GitHub account")
 	repoBranch := fs.String("repo-branch", defaultRepoBranch, "(repo) branch to commit to")
 	passFile := fs.String("passphrase-file", "", "(passphrase tier) read passphrase from file")
@@ -576,6 +582,15 @@ func printSummaryGist(dev state.Device, stateDir string) {
 	fmt.Printf("  Subject       = device:%s\n\n", dev.DeviceID)
 	fmt.Printf("Then:\n")
 	fmt.Printf("  tapid serve\n")
+}
+
+// clientIDDefault returns the OAuth client ID to use for GitHub device flow.
+// Priority: TAPID_GITHUB_CLIENT_ID env var > bundled default.
+func clientIDDefault() string {
+	if v := os.Getenv("TAPID_GITHUB_CLIENT_ID"); v != "" {
+		return v
+	}
+	return defaultGitHubClientID
 }
 
 // resolveTier turns the user-facing --key-tier flag into a concrete tier.
