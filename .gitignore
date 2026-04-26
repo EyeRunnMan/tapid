@@ -1,0 +1,18 @@
+# build artifacts
+/tapid
+/tapid.exe
+/dist/
+/build/
+
+# state
+/tapid-publish/
+*.db
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
