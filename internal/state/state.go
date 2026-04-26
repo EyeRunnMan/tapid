@@ -3,6 +3,7 @@ package state
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
@@ -44,21 +45,24 @@ type Device struct {
 const (
 	deviceFile      = "device.json"
 	keyFile         = "key.enc"
+	tpmKeyFile      = "key.tpm"
 	githubTokenFile = "github.enc"
 )
 
 // DevicePath returns the device metadata path inside stateDir.
 func DevicePath(stateDir string) string { return filepath.Join(stateDir, deviceFile) }
 
-// KeyPath returns the encrypted key path inside stateDir.
+// KeyPath returns the passphrase-encrypted key path inside stateDir.
 func KeyPath(stateDir string) string { return filepath.Join(stateDir, keyFile) }
+
+// TPMKeyPath returns the TPM-wrapped key path inside stateDir.
+func TPMKeyPath(stateDir string) string { return filepath.Join(stateDir, tpmKeyFile) }
 
 // GitHubTokenPath returns the encrypted GitHub OAuth token path inside stateDir.
 func GitHubTokenPath(stateDir string) string { return filepath.Join(stateDir, githubTokenFile) }
 
-// NewDeviceID returns a fresh device id: 6 base32-lowercased characters,
-// stable across restarts (caller persists). ~30 bits of entropy is enough
-// per device in a small org; collisions detected at registration time.
+// NewDeviceID returns a fresh random device id: 6 base32-lowercased characters.
+// Used for tier-4 (passphrase) where there's no stable hardware identity.
 func NewDeviceID() (string, error) {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -70,6 +74,17 @@ func NewDeviceID() (string, error) {
 		return s, nil
 	}
 	return s[:6], nil
+}
+
+// DeviceIDFromPubBlob derives a stable device id from a public key blob.
+// Same TPM + same key = same device_id across reinits. Different TPM or
+// rotated key = different id.
+//
+// id = first 6 chars of base32-lowercased SHA-256 of the public blob.
+func DeviceIDFromPubBlob(pub []byte) string {
+	sum := sha256.Sum256(pub)
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
+	return strings.ToLower(enc.EncodeToString(sum[:]))[:6]
 }
 
 // NewKid returns a kid string. We bind kid to device_id for now: "k-<deviceID>".

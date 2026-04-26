@@ -67,7 +67,11 @@ Usage:
 
 Common flags:
   --state-dir <path>          where device key + metadata live (default: ~/.tapid)
-  --passphrase-file <path>    read passphrase from file (no TTY prompt)
+  --passphrase-file <path>    read passphrase from file (passphrase tier only)
+  --key-tier <name>           auto|tpm|passphrase (default: auto)
+                              auto = use TPM if available, else passphrase
+                              tpm  = Windows TBS only in v0.3
+                              passphrase = scrypt+AES-GCM file
 
 Init flags:
   --publish=manual|gist|repo  publishing mode (default: manual)
@@ -110,33 +114,66 @@ func runInit(args []string) {
 	clientID := fs.String("github-client-id", os.Getenv("TAPID_GITHUB_CLIENT_ID"), "(gist|repo) OAuth App client ID")
 	repoName := fs.String("repo-name", defaultRepoName, "(repo) repo name on your GitHub account")
 	repoBranch := fs.String("repo-branch", defaultRepoBranch, "(repo) branch to commit to")
-	passFile := fs.String("passphrase-file", "", "read passphrase from file")
+	passFile := fs.String("passphrase-file", "", "(passphrase tier) read passphrase from file")
+	keyTier := fs.String("key-tier", "auto", "auto|tpm|passphrase")
 	_ = fs.Parse(args)
 
-	if _, err := os.Stat(state.KeyPath(*stateDir)); err == nil {
-		log.Fatalf("init: %s already exists; delete to re-init", state.KeyPath(*stateDir))
+	tier := resolveTier(*keyTier)
+
+	switch tier {
+	case keystore.TierTPM:
+		if _, err := os.Stat(state.TPMKeyPath(*stateDir)); err == nil {
+			log.Fatalf("init: %s already exists; delete to re-init", state.TPMKeyPath(*stateDir))
+		}
+	case keystore.TierPassphrase:
+		if _, err := os.Stat(state.KeyPath(*stateDir)); err == nil {
+			log.Fatalf("init: %s already exists; delete to re-init", state.KeyPath(*stateDir))
+		}
 	}
 
-	pass, err := readPassphrase(*passFile, true)
-	if err != nil {
-		log.Fatalf("init: passphrase: %v", err)
-	}
-	defer zero(pass)
-
-	deviceID, err := state.NewDeviceID()
-	if err != nil {
-		log.Fatalf("init: device id: %v", err)
-	}
 	dev := state.Device{
-		DeviceID:  deviceID,
-		Kid:       state.NewKid(deviceID),
-		KeyTier:   keystore.TierPassphrase.String(),
+		KeyTier:   tier.String(),
 		CreatedAt: time.Now().UTC(),
 	}
 
-	store, err := keystore.GeneratePassphrase(state.KeyPath(*stateDir), pass)
-	if err != nil {
-		log.Fatalf("init: generate key: %v", err)
+	var (
+		store keystore.Store
+		pass  []byte
+		err   error
+	)
+
+	switch tier {
+	case keystore.TierTPM:
+		fmt.Fprintln(os.Stderr, "→ generating TPM-bound key (no passphrase needed)…")
+		tpmStore, terr := keystore.GenerateTPM(state.TPMKeyPath(*stateDir))
+		if terr != nil {
+			log.Fatalf("init: tpm: %v", terr)
+		}
+		store = tpmStore
+		dev.DeviceID = state.DeviceIDFromPubBlob(tpmStore.PublicKeyBlob())
+		dev.Kid = state.NewKid(dev.DeviceID)
+		fmt.Fprintf(os.Stderr, "✓ tpm key created (device_id derived from key thumbprint: %s)\n", dev.DeviceID)
+
+	case keystore.TierPassphrase:
+		pass, err = readPassphrase(*passFile, true)
+		if err != nil {
+			log.Fatalf("init: passphrase: %v", err)
+		}
+		defer zero(pass)
+
+		dev.DeviceID, err = state.NewDeviceID()
+		if err != nil {
+			log.Fatalf("init: device id: %v", err)
+		}
+		dev.Kid = state.NewKid(dev.DeviceID)
+
+		store, err = keystore.GeneratePassphrase(state.KeyPath(*stateDir), pass)
+		if err != nil {
+			log.Fatalf("init: generate key: %v", err)
+		}
+
+	default:
+		log.Fatalf("init: unsupported key tier %s", tier)
 	}
 
 	switch *publishMode {
@@ -249,10 +286,14 @@ func initGist(stateDir string, dev *state.Device, store keystore.Store, clientID
 		return fmt.Errorf("update gist: %w", err)
 	}
 
-	// Persist the OAuth token (encrypted under the same passphrase).
-	if err := keystore.SealSecret(state.GitHubTokenPath(stateDir),
-		[]byte(tok.AccessToken), pass); err != nil {
-		return fmt.Errorf("seal github token: %w", err)
+	// Persist the OAuth token if we have a passphrase to seal it under.
+	// TPM tier has no passphrase; republish in that case will require
+	// re-running OAuth (handled in v0.4 via OS keyring).
+	if pass != nil {
+		if err := keystore.SealSecret(state.GitHubTokenPath(stateDir),
+			[]byte(tok.AccessToken), pass); err != nil {
+			return fmt.Errorf("seal github token: %w", err)
+		}
 	}
 
 	return nil
@@ -325,8 +366,10 @@ func initRepo(stateDir string, dev *state.Device, store keystore.Store, clientID
 		return fmt.Errorf("put jwks: %w", err)
 	}
 
-	if err := keystore.SealSecret(state.GitHubTokenPath(stateDir), []byte(tok.AccessToken), pass); err != nil {
-		return fmt.Errorf("seal github token: %w", err)
+	if pass != nil {
+		if err := keystore.SealSecret(state.GitHubTokenPath(stateDir), []byte(tok.AccessToken), pass); err != nil {
+			return fmt.Errorf("seal github token: %w", err)
+		}
 	}
 	return nil
 }
@@ -418,15 +461,29 @@ func runServe(args []string) {
 	if err != nil {
 		log.Fatalf("serve: load device: %v (run `tapid init` first)", err)
 	}
-	pass, err := readPassphrase(*passFile, false)
-	if err != nil {
-		log.Fatalf("serve: passphrase: %v", err)
-	}
-	defer zero(pass)
 
-	store, err := keystore.OpenPassphrase(state.KeyPath(*stateDir), pass)
-	if err != nil {
-		log.Fatalf("serve: open key: %v", err)
+	var store keystore.Store
+	switch dev.KeyTier {
+	case keystore.TierTPM.String():
+		s, err := keystore.OpenTPM(state.TPMKeyPath(*stateDir))
+		if err != nil {
+			log.Fatalf("serve: open tpm: %v", err)
+		}
+		defer s.Close()
+		store = s
+	case keystore.TierPassphrase.String(), "":
+		pass, err := readPassphrase(*passFile, false)
+		if err != nil {
+			log.Fatalf("serve: passphrase: %v", err)
+		}
+		defer zero(pass)
+		ps, err := keystore.OpenPassphrase(state.KeyPath(*stateDir), pass)
+		if err != nil {
+			log.Fatalf("serve: open key: %v", err)
+		}
+		store = ps
+	default:
+		log.Fatalf("serve: unknown key_tier %q in device.json", dev.KeyTier)
 	}
 
 	cfg := server.Config{
@@ -519,6 +576,30 @@ func printSummaryGist(dev state.Device, stateDir string) {
 	fmt.Printf("  Subject       = device:%s\n\n", dev.DeviceID)
 	fmt.Printf("Then:\n")
 	fmt.Printf("  tapid serve\n")
+}
+
+// resolveTier turns the user-facing --key-tier flag into a concrete tier.
+// "auto" picks tier 1 (TPM) on Windows if TBS reachable, else tier 4.
+func resolveTier(name string) keystore.Tier {
+	switch name {
+	case "tpm":
+		if err := keystore.ProbeTPM(); err != nil {
+			log.Fatalf("init: --key-tier=tpm but TPM not reachable: %v", err)
+		}
+		return keystore.TierTPM
+	case "passphrase":
+		return keystore.TierPassphrase
+	case "auto", "":
+		if err := keystore.ProbeTPM(); err == nil {
+			fmt.Fprintln(os.Stderr, "→ TPM detected, using tier 1 (hardware-bound key)")
+			return keystore.TierTPM
+		}
+		fmt.Fprintln(os.Stderr, "→ no TPM, falling back to tier 4 (passphrase)")
+		return keystore.TierPassphrase
+	default:
+		log.Fatalf("init: unknown --key-tier %q (use auto, tpm, or passphrase)", name)
+		return keystore.TierUnknown
+	}
 }
 
 // mustJWKS panics if the public key isn't a supported type. Used at points
