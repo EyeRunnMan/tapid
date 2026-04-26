@@ -39,12 +39,19 @@ try {
     $zip = Join-Path $tmp $asset
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
 
-    # Checksum
+    # Checksum — Invoke-WebRequest may return Content as byte[] when MIME isn't
+    # text/*. Decode explicitly so the hash isn't read as ASCII bytes (e.g. 'c'
+    # = 99, which produced the bogus "expected 99" mismatch in v0.3.0).
     try {
-        $expectedLine = (Invoke-WebRequest -Uri $shaUrl -UseBasicParsing).Content
-        $expected = ($expectedLine -split '\s+')[0]
+        $resp = Invoke-WebRequest -Uri $shaUrl -UseBasicParsing
+        $bodyText = if ($resp.Content -is [byte[]]) {
+            [System.Text.Encoding]::UTF8.GetString($resp.Content)
+        } else {
+            [string]$resp.Content
+        }
+        $expected = (($bodyText -split '\s+') | Where-Object { $_ -ne '' })[0].ToLower()
         $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
-        if ($expected.ToLower() -ne $actual) {
+        if ($expected -ne $actual) {
             throw "sha256 mismatch (expected $expected, got $actual)"
         }
         Write-Host "✓ sha256 verified"
