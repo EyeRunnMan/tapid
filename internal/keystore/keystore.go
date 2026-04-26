@@ -1,16 +1,13 @@
 // Package keystore manages the device signing key across tiered backends.
 //
 // Tier selection per SPEC §5:
-//   1. TPM 2.0 / Apple Secure Enclave  (non-extractable)
-//   2. OS keyring                       (DPAPI / Keychain / Secret Service)
-//   3. KMS-wrapped file                 (AWS / GCP / Azure / age)
-//   4. Passphrase-encrypted file        (fallback)
+//   1. TPM 2.0 / Apple Secure Enclave  (non-extractable)         [v0.2]
+//   2. OS keyring                       (DPAPI / Keychain / DBus) [v0.2]
+//   3. KMS-wrapped file                 (AWS / GCP / Azure / age) [v0.2]
+//   4. Passphrase-encrypted file        (fallback)                [v0.1 — implemented]
 package keystore
 
-import (
-	"crypto/ed25519"
-	"errors"
-)
+import "crypto/ed25519"
 
 // Tier identifies which backend holds the active private key.
 type Tier int
@@ -39,7 +36,7 @@ func (t Tier) String() string {
 }
 
 // Store is the keystore interface. Implementations live alongside this file
-// per backend (tpm.go, keyring.go, kms.go, passphrase.go).
+// per backend (passphrase.go now; tpm.go, keyring.go, kms.go in v0.2).
 type Store interface {
 	// Tier reports which backend this store uses.
 	Tier() Tier
@@ -49,12 +46,3 @@ type Store interface {
 	// For tier 1, this calls into hardware; the key bytes never leave silicon.
 	Sign(msg []byte) ([]byte, error)
 }
-
-// Open returns the highest-tier store available, or the requested tier if
-// the caller forces one. Returns ErrNoTier if nothing usable exists.
-func Open(stateDir string, force Tier) (Store, error) {
-	return nil, errors.New("keystore.Open: not implemented")
-}
-
-// ErrNoTier is returned when no usable tier was found.
-var ErrNoTier = errors.New("no usable key tier available")

@@ -2,24 +2,41 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
+
+	"github.com/EyeRunnMan/tapid/internal/jwks"
+	"github.com/EyeRunnMan/tapid/internal/jwt"
+	"github.com/EyeRunnMan/tapid/internal/keystore"
+	"github.com/EyeRunnMan/tapid/internal/state"
 )
 
 type Config struct {
-	Addr     string
-	StateDir string
-	MaxTTL   int
+	Addr   string
+	MaxTTL int
+
+	Device  state.Device
+	Signer  keystore.Store
 }
 
 func Run(cfg Config) error {
-	mux := http.NewServeMux()
+	if cfg.Signer == nil {
+		return errors.New("server: nil signer")
+	}
+	if cfg.Device.IssuerURL == "" {
+		return errors.New("server: empty issuer URL")
+	}
+	if cfg.MaxTTL <= 0 {
+		cfg.MaxTTL = 3600
+	}
 
+	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealth)
-	mux.HandleFunc("GET /.well-known/openid-configuration", handleDiscovery)
-	mux.HandleFunc("GET /jwks.json", handleJWKS)
+	mux.HandleFunc("GET /.well-known/openid-configuration", handleDiscovery(cfg))
+	mux.HandleFunc("GET /jwks.json", handleJWKS(cfg))
 	mux.HandleFunc("POST /token", handleToken(cfg))
 
 	srv := &http.Server{
@@ -27,8 +44,8 @@ func Run(cfg Config) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
-	log.Printf("tapid listening on http://%s", cfg.Addr)
+	log.Printf("tapid listening on http://%s (issuer=%s tier=%s)",
+		cfg.Addr, cfg.Device.IssuerURL, cfg.Device.KeyTier)
 	return srv.ListenAndServe()
 }
 
@@ -36,28 +53,95 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func handleDiscovery(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not_implemented"})
+func handleDiscovery(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, jwks.Discovery(cfg.Device.IssuerURL))
+	}
 }
 
-func handleJWKS(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not_implemented"})
+func handleJWKS(cfg Config) http.HandlerFunc {
+	set := jwks.FromEd25519(cfg.Signer.PublicKey(), cfg.Device.Kid)
+	return func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, set)
+	}
+}
+
+// tokenClaims is the JWT body. Field order matches SPEC §7.
+type tokenClaims struct {
+	Iss        string `json:"iss"`
+	Sub        string `json:"sub"`
+	Aud        string `json:"aud"`
+	Iat        int64  `json:"iat"`
+	Exp        int64  `json:"exp"`
+	Jti        string `json:"jti"`
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name,omitempty"`
+	KeyTier    string `json:"key_tier"`
+}
+
+type tokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
 }
 
 func handleToken(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		audience := r.FormValue("audience")
-		if audience == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "audience_required"})
+		if err := r.ParseForm(); err != nil {
+			writeJSON(w, http.StatusBadRequest, errResp("bad_request"))
 			return
 		}
-		writeJSON(w, http.StatusNotImplemented, map[string]string{
-			"error":  "not_implemented",
-			"detail": fmt.Sprintf("audience=%s max_ttl=%d", audience, cfg.MaxTTL),
+		audience := r.FormValue("audience")
+		if audience == "" {
+			writeJSON(w, http.StatusBadRequest, errResp("audience_required"))
+			return
+		}
+
+		ttl := cfg.MaxTTL
+		if v := r.FormValue("ttl"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				writeJSON(w, http.StatusBadRequest, errResp("ttl_invalid"))
+				return
+			}
+			if n > cfg.MaxTTL {
+				n = cfg.MaxTTL
+			}
+			ttl = n
+		}
+
+		now := time.Now().UTC()
+		jti, err := newJTI()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errResp("jti_failed"))
+			return
+		}
+		claims := tokenClaims{
+			Iss:        cfg.Device.IssuerURL,
+			Sub:        "device:" + cfg.Device.DeviceID,
+			Aud:        audience,
+			Iat:        now.Unix(),
+			Exp:        now.Add(time.Duration(ttl) * time.Second).Unix(),
+			Jti:        jti,
+			DeviceID:   cfg.Device.DeviceID,
+			DeviceName: hostnameSafe(),
+			KeyTier:    cfg.Device.KeyTier,
+		}
+
+		tok, err := jwt.Sign(claims, cfg.Device.Kid, cfg.Signer)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errResp("sign_failed"))
+			return
+		}
+		writeJSON(w, http.StatusOK, tokenResponse{
+			AccessToken: tok,
+			TokenType:   "Bearer",
+			ExpiresIn:   ttl,
 		})
 	}
 }
+
+func errResp(code string) map[string]string { return map[string]string{"error": code} }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {
 	w.Header().Set("Content-Type", "application/json")
