@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # required to create releases + upload artifacts
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+            archive: tar.gz
+          - os: linux
+            arch: arm64
+            ext: ""
+            archive: tar.gz
+          - os: darwin
+            arch: amd64
+            ext: ""
+            archive: tar.gz
+          - os: darwin
+            arch: arm64
+            ext: ""
+            archive: tar.gz
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+            archive: zip
+          - os: windows
+            arch: arm64
+            ext: ".exe"
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          BIN="dist/tapid${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o "$BIN" ./cmd/tapid
+
+      - name: package
+        id: pkg
+        run: |
+          VER="${GITHUB_REF_NAME}"
+          NAME="tapid_${VER}_${{ matrix.os }}_${{ matrix.arch }}"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            mv "tapid${{ matrix.ext }}" "tapid${{ matrix.ext }}"
+            zip "${NAME}.zip" "tapid${{ matrix.ext }}" ../LICENSE ../README.md
+            echo "asset=${NAME}.zip" >> "$GITHUB_OUTPUT"
+            sha256sum "${NAME}.zip" > "${NAME}.zip.sha256"
+            echo "sha=${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "${NAME}.tar.gz" "tapid${{ matrix.ext }}" -C .. LICENSE README.md
+            echo "asset=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+            sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+            echo "sha=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: upload
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.pkg.outputs.asset }}
+            dist/${{ steps.pkg.outputs.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
