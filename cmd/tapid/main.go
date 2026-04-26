@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/EyeRunnMan/tapid/internal/cli"
+	"github.com/EyeRunnMan/tapid/internal/github"
 	"github.com/EyeRunnMan/tapid/internal/jwks"
 	"github.com/EyeRunnMan/tapid/internal/keystore"
 	"github.com/EyeRunnMan/tapid/internal/server"
@@ -17,7 +20,9 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.1.0-dev"
+const version = "0.2.0-dev"
+
+const githubScopes = "gist"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -30,6 +35,8 @@ func main() {
 		runInit(os.Args[2:])
 	case "serve":
 		runServe(os.Args[2:])
+	case "republish":
+		runRepublish(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("tapid", version)
 	case "help", "-h", "--help":
@@ -45,22 +52,31 @@ func usage() {
 	fmt.Fprint(os.Stderr, `tapid — localhost OIDC issuer for laptops and bare VPS
 
 Usage:
-  tapid init   [flags]    generate keypair, encrypt, write publish dir
-  tapid serve  [flags]    run the HTTP daemon
-  tapid version           print version
-  tapid help              this message
+  tapid init      [flags]   generate keypair, encrypt, publish JWKS
+  tapid serve     [flags]   run the HTTP daemon
+  tapid republish [flags]   push current JWKS to the existing gist
+  tapid version             print version
+  tapid help                this message
 
 Common flags:
-  --state-dir <path>      where device key + metadata live (default: ~/.tapid)
-  --issuer-url <url>      (init) fully-qualified issuer URL where JWKS will be hosted
-  --addr <host:port>      (serve) bind address (default: 127.0.0.1:53682)
-  --max-ttl <seconds>     (serve) max JWT lifetime (default: 3600)
-  --passphrase-file <p>   read passphrase from file (no TTY prompt)
-  --publish-dir <path>    (init) where to write jwks.json + .well-known/...
-                          (default: <state-dir>/publish)
+  --state-dir <path>          where device key + metadata live (default: ~/.tapid)
+  --passphrase-file <path>    read passphrase from file (no TTY prompt)
+
+Init flags:
+  --publish=manual|gist       publishing mode (default: manual)
+  --issuer-url <url>          (manual mode) fully-qualified issuer URL
+  --publish-dir <path>        (manual mode) where to write JWKS + discovery
+                              (default: <state-dir>/publish)
+  --github-client-id <id>     (gist mode) OAuth App client ID
+                              (or env TAPID_GITHUB_CLIENT_ID)
+
+Serve flags:
+  --addr <host:port>          bind address (default: 127.0.0.1:53682)
+  --max-ttl <seconds>         max JWT lifetime (default: 3600)
 
 Env:
-  TAPID_PASSPHRASE        passphrase via env (overrides --passphrase-file)
+  TAPID_PASSPHRASE            passphrase (overrides file/TTY)
+  TAPID_GITHUB_CLIENT_ID      GitHub OAuth App client ID
 
 See SPEC.md for design.
 `)
@@ -71,18 +87,15 @@ See SPEC.md for design.
 func runInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	stateDir := fs.String("state-dir", defaultStateDir(), "where device key + metadata live")
-	issuerURL := fs.String("issuer-url", "", "fully-qualified issuer URL where JWKS will be hosted")
-	publishDir := fs.String("publish-dir", "", "where to write JWKS + discovery (default: <state-dir>/publish)")
+	publishMode := fs.String("publish", "manual", "manual|gist")
+	issuerURL := fs.String("issuer-url", "", "(manual) fully-qualified issuer URL")
+	publishDir := fs.String("publish-dir", "", "(manual) where to write JWKS + discovery")
+	clientID := fs.String("github-client-id", os.Getenv("TAPID_GITHUB_CLIENT_ID"), "(gist) OAuth App client ID")
 	passFile := fs.String("passphrase-file", "", "read passphrase from file")
 	_ = fs.Parse(args)
 
-	if *issuerURL == "" {
-		log.Fatal("--issuer-url is required (e.g. https://idp.example.com/devices/n4xqz1)")
-	}
-	*issuerURL = strings.TrimRight(*issuerURL, "/")
-
 	if _, err := os.Stat(state.KeyPath(*stateDir)); err == nil {
-		log.Fatalf("init: %s already exists; delete it to re-init", state.KeyPath(*stateDir))
+		log.Fatalf("init: %s already exists; delete to re-init", state.KeyPath(*stateDir))
 	}
 
 	pass, err := readPassphrase(*passFile, true)
@@ -98,7 +111,6 @@ func runInit(args []string) {
 	dev := state.Device{
 		DeviceID:  deviceID,
 		Kid:       state.NewKid(deviceID),
-		IssuerURL: *issuerURL,
 		KeyTier:   keystore.TierPassphrase.String(),
 		CreatedAt: time.Now().UTC(),
 	}
@@ -107,52 +119,163 @@ func runInit(args []string) {
 	if err != nil {
 		log.Fatalf("init: generate key: %v", err)
 	}
+
+	switch *publishMode {
+	case "manual":
+		if *issuerURL == "" {
+			log.Fatal("init: --issuer-url is required for manual mode")
+		}
+		dev.IssuerURL = strings.TrimRight(*issuerURL, "/")
+		dev.PublishMode = "manual"
+		pub := *publishDir
+		if pub == "" {
+			pub = filepath.Join(*stateDir, "publish")
+		}
+		if err := writePublishDir(pub, dev, store); err != nil {
+			log.Fatalf("init: publish: %v", err)
+		}
+		printSummaryManual(dev, *stateDir, pub)
+
+	case "gist":
+		if *clientID == "" {
+			log.Fatal("init: --github-client-id (or TAPID_GITHUB_CLIENT_ID) required for gist mode")
+		}
+		if err := initGist(*stateDir, &dev, store, *clientID, pass); err != nil {
+			log.Fatalf("init: gist: %v", err)
+		}
+		printSummaryGist(dev, *stateDir)
+
+	default:
+		log.Fatalf("init: unknown --publish mode %q (use manual or gist)", *publishMode)
+	}
+
 	if err := dev.Save(*stateDir); err != nil {
 		log.Fatalf("init: save device.json: %v", err)
 	}
-
-	pub := *publishDir
-	if pub == "" {
-		pub = filepath.Join(*stateDir, "publish")
-	}
-	if err := writePublish(pub, dev, store); err != nil {
-		log.Fatalf("init: publish: %v", err)
-	}
-
-	fmt.Printf("\nDevice initialized.\n")
-	fmt.Printf("  device_id : %s\n", dev.DeviceID)
-	fmt.Printf("  kid       : %s\n", dev.Kid)
-	fmt.Printf("  issuer    : %s\n", dev.IssuerURL)
-	fmt.Printf("  key tier  : %s\n", dev.KeyTier)
-	fmt.Printf("  state dir : %s\n", *stateDir)
-	fmt.Printf("  publish   : %s\n\n", pub)
-	fmt.Printf("Next:\n")
-	fmt.Printf("  1. Upload the contents of %s to %s/\n", pub, dev.IssuerURL)
-	fmt.Printf("     (so that %s/.well-known/openid-configuration is reachable)\n", dev.IssuerURL)
-	fmt.Printf("  2. Run:  tapid serve\n")
 }
 
-func writePublish(dir string, dev state.Device, store keystore.Store) error {
-	if err := os.MkdirAll(filepath.Join(dir, ".well-known"), 0o755); err != nil {
-		return err
-	}
-	disc := jwks.Discovery(dev.IssuerURL)
-	if err := writeJSONFile(filepath.Join(dir, ".well-known", "openid-configuration"), disc); err != nil {
-		return err
-	}
-	set := jwks.FromEd25519(store.PublicKey(), dev.Kid)
-	return writeJSONFile(filepath.Join(dir, "jwks.json"), set)
-}
+// ---- gist init flow --------------------------------------------------------
 
-func writeJSONFile(path string, v any) error {
-	f, err := os.Create(path)
+func initGist(stateDir string, dev *state.Device, store keystore.Store, clientID string, pass []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	fmt.Fprintln(os.Stderr, "→ requesting GitHub device code…")
+	dc, err := github.StartDeviceFlow(ctx, clientID, githubScopes)
+	if err != nil {
+		return fmt.Errorf("device-flow start: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n  Open: %s\n  Code: %s\n  (expires in %d s)\n\n",
+		dc.VerificationURI, dc.UserCode, dc.ExpiresIn)
+	cli.OpenBrowser(dc.VerificationURI)
+
+	fmt.Fprintln(os.Stderr, "→ waiting for you to approve in the browser…")
+	tok, err := github.PollForToken(ctx, clientID, dc)
+	if err != nil {
+		return fmt.Errorf("device-flow poll: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "✓ authorized")
+
+	// Phase 1: create gist with placeholder content (we don't know gist_id yet,
+	// so we can't compute the issuer URL). Two filenames are reserved.
+	dev.GistFileJWKS = "jwks.json"
+	dev.GistFileDiscovery = "openid-configuration"
+	dev.PublishMode = "gist"
+
+	placeholder := map[string]string{
+		dev.GistFileJWKS:      `{"keys":[]}`,
+		dev.GistFileDiscovery: `{"placeholder":true}`,
+	}
+	desc := fmt.Sprintf("tapid OIDC JWKS for device %s (managed; do not edit)", dev.DeviceID)
+
+	fmt.Fprintln(os.Stderr, "→ creating gist…")
+	g, err := github.CreateGist(ctx, tok.AccessToken, desc, placeholder)
+	if err != nil {
+		return fmt.Errorf("create gist: %w", err)
+	}
+	dev.GistID = g.ID
+	dev.GistOwner = g.Owner.Login
+	dev.IssuerURL = github.RawURL(dev.GistOwner, dev.GistID, dev.GistFileDiscovery)
+
+	// Phase 2: update gist with real discovery + jwks pointing at the real
+	// raw URLs.
+	disc, err := encodeJSON(jwks.Discovery(dev.IssuerURL).WithJWKS(
+		github.RawURL(dev.GistOwner, dev.GistID, dev.GistFileJWKS)))
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
+	set, err := encodeJSON(jwks.FromEd25519(store.PublicKey(), dev.Kid))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "→ uploading discovery + JWKS…")
+	if _, err := github.UpdateGist(ctx, tok.AccessToken, dev.GistID, map[string]string{
+		dev.GistFileDiscovery: disc,
+		dev.GistFileJWKS:      set,
+	}); err != nil {
+		return fmt.Errorf("update gist: %w", err)
+	}
+
+	// Persist the OAuth token (encrypted under the same passphrase).
+	if err := keystore.SealSecret(state.GitHubTokenPath(stateDir),
+		[]byte(tok.AccessToken), pass); err != nil {
+		return fmt.Errorf("seal github token: %w", err)
+	}
+
+	return nil
+}
+
+// ---- republish -------------------------------------------------------------
+
+func runRepublish(args []string) {
+	fs := flag.NewFlagSet("republish", flag.ExitOnError)
+	stateDir := fs.String("state-dir", defaultStateDir(), "where device key + metadata live")
+	passFile := fs.String("passphrase-file", "", "read passphrase from file")
+	_ = fs.Parse(args)
+
+	dev, err := state.Load(*stateDir)
+	if err != nil {
+		log.Fatalf("republish: load device: %v", err)
+	}
+	if dev.PublishMode != "gist" {
+		log.Fatalf("republish: device is in %q mode; only gist mode is republishable", dev.PublishMode)
+	}
+
+	pass, err := readPassphrase(*passFile, false)
+	if err != nil {
+		log.Fatalf("republish: passphrase: %v", err)
+	}
+	defer zero(pass)
+
+	store, err := keystore.OpenPassphrase(state.KeyPath(*stateDir), pass)
+	if err != nil {
+		log.Fatalf("republish: open key: %v", err)
+	}
+	tokenBytes, err := keystore.OpenSecret(state.GitHubTokenPath(*stateDir), pass)
+	if err != nil {
+		log.Fatalf("republish: open token: %v", err)
+	}
+
+	disc, err := encodeJSON(jwks.Discovery(dev.IssuerURL).WithJWKS(
+		github.RawURL(dev.GistOwner, dev.GistID, dev.GistFileJWKS)))
+	if err != nil {
+		log.Fatal(err)
+	}
+	set, err := encodeJSON(jwks.FromEd25519(store.PublicKey(), dev.Kid))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := github.UpdateGist(ctx, string(tokenBytes), dev.GistID, map[string]string{
+		dev.GistFileDiscovery: disc,
+		dev.GistFileJWKS:      set,
+	}); err != nil {
+		log.Fatalf("republish: %v", err)
+	}
+	fmt.Println("republished:", dev.IssuerURL)
 }
 
 // ---- serve -----------------------------------------------------------------
@@ -193,6 +316,67 @@ func runServe(args []string) {
 
 // ---- helpers ---------------------------------------------------------------
 
+func writePublishDir(dir string, dev state.Device, store keystore.Store) error {
+	if err := os.MkdirAll(filepath.Join(dir, ".well-known"), 0o755); err != nil {
+		return err
+	}
+	disc := jwks.Discovery(dev.IssuerURL)
+	if err := writeJSONFile(filepath.Join(dir, ".well-known", "openid-configuration"), disc); err != nil {
+		return err
+	}
+	set := jwks.FromEd25519(store.PublicKey(), dev.Kid)
+	return writeJSONFile(filepath.Join(dir, "jwks.json"), set)
+}
+
+func writeJSONFile(path string, v any) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+func encodeJSON(v any) (string, error) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func printSummaryManual(dev state.Device, stateDir, pub string) {
+	fmt.Printf("\nDevice initialized (manual publish).\n")
+	fmt.Printf("  device_id : %s\n", dev.DeviceID)
+	fmt.Printf("  kid       : %s\n", dev.Kid)
+	fmt.Printf("  issuer    : %s\n", dev.IssuerURL)
+	fmt.Printf("  key tier  : %s\n", dev.KeyTier)
+	fmt.Printf("  state dir : %s\n", stateDir)
+	fmt.Printf("  publish   : %s\n\n", pub)
+	fmt.Printf("Next:\n")
+	fmt.Printf("  1. Upload contents of %s to %s/\n", pub, dev.IssuerURL)
+	fmt.Printf("  2. Run:  tapid serve\n")
+}
+
+func printSummaryGist(dev state.Device, stateDir string) {
+	fmt.Printf("\nDevice initialized (gist publish).\n")
+	fmt.Printf("  device_id  : %s\n", dev.DeviceID)
+	fmt.Printf("  kid        : %s\n", dev.Kid)
+	fmt.Printf("  gist owner : %s\n", dev.GistOwner)
+	fmt.Printf("  gist id    : %s\n", dev.GistID)
+	fmt.Printf("  issuer URL : %s\n", dev.IssuerURL)
+	fmt.Printf("  jwks URL   : %s\n",
+		github.RawURL(dev.GistOwner, dev.GistID, dev.GistFileJWKS))
+	fmt.Printf("  state dir  : %s\n\n", stateDir)
+	fmt.Printf("Configure your relying party (Infisical, etc.) with:\n")
+	fmt.Printf("  Discovery URL = %s\n", dev.IssuerURL)
+	fmt.Printf("  Subject       = device:%s\n\n", dev.DeviceID)
+	fmt.Printf("Then:\n")
+	fmt.Printf("  tapid serve\n")
+}
+
 func defaultStateDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -201,13 +385,6 @@ func defaultStateDir() string {
 	return filepath.Join(home, ".tapid")
 }
 
-// readPassphrase pulls a passphrase from (in priority order):
-//
-//  1. TAPID_PASSPHRASE env var
-//  2. --passphrase-file
-//  3. interactive TTY prompt
-//
-// If confirm is true (init), the prompt asks twice and verifies they match.
 func readPassphrase(file string, confirm bool) ([]byte, error) {
 	if env := os.Getenv("TAPID_PASSPHRASE"); env != "" {
 		return []byte(env), nil
@@ -259,4 +436,3 @@ func zero(b []byte) {
 		b[i] = 0
 	}
 }
-

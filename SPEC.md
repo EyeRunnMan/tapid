@@ -176,29 +176,58 @@ Env:
 
 ## 9. Bootstrap
 
-### 9.1 Interactive (laptop)
+Three publish modes (the `--publish=` flag on `tapid init`):
+
+### 9.1 Manual (`--publish=manual`) — works everywhere, you host
 
 ```
-$ tapid init
-  → opens browser, GitHub OAuth device flow
-  → generates Ed25519 keypair (in TPM/SE if available)
-  → writes device metadata to ~/.tapid/device.json
-  → prints jwks.json + openid-configuration to ./tapid-publish/
-  → tells you to upload that dir to your JWKS host
-  → prints the issuer URL to use
+$ tapid init --publish=manual \
+             --issuer-url=https://idp.example.com/devices/n4xqz1
+  → prompts for a passphrase (or reads --passphrase-file / TAPID_PASSPHRASE)
+  → generates Ed25519 keypair, encrypts under passphrase
+  → writes ~/.tapid/{device.json, key.enc}
+  → emits ~/.tapid/publish/{jwks.json, .well-known/openid-configuration}
+  → you upload the publish dir to wherever your issuer URL serves from
 $ tapid serve
   → daemon up on 127.0.0.1:53682
 ```
 
-### 9.2 Headless (VPS)
+### 9.2 Gist (`--publish=gist`) — fastest, GitHub hosts
 
 ```
-$ tapid init --headless --register-token=$BOOTSTRAP_TOKEN \
-             --issuer-url=https://idp.example.com/devices/svc-deployer-1
-  → registers without browser
-  → publishes JWKS to a configured remote (bucket / git push)
+$ tapid init --publish=gist --github-client-id=Iv1.abc123…
+  → prompts for a passphrase
+  → generates Ed25519 keypair, encrypts under passphrase
+  → starts GitHub OAuth device flow:
+      Open: https://github.com/login/device
+      Code: ABCD-1234
+  → opens browser, you approve "tapid wants gist scope"
+  → tapid creates a public gist, computes the issuer URL from gist owner+id
+  → updates the gist with a discovery doc + JWKS pointing at the right URLs
+  → encrypts the GH OAuth token under the same passphrase, stores at github.enc
+  → prints the issuer URL to configure in your relying party
 $ tapid serve
 ```
+
+To rotate keys later or push updated JWKS:
+
+```
+$ tapid republish
+  → re-encodes JWKS + discovery from current device key, PATCHes the gist
+```
+
+### 9.3 Headless (`--publish=manual` + `--passphrase-file` on VPS)
+
+```
+$ tapid init --publish=manual \
+             --issuer-url=https://idp.example.com/devices/svc-deployer-1 \
+             --passphrase-file=/run/secrets/tapid.pass
+$ tapid serve --passphrase-file=/run/secrets/tapid.pass
+```
+
+Headless gist mode is deferred (browser SSO doesn't fit unattended VPS).
+Use a one-time `tapid init` on a workstation with the VPS's intended state-dir
+mounted, then ship the resulting `~/.tapid` directory.
 
 ---
 
@@ -234,10 +263,12 @@ Hard rules:
 
 ## 12. Roadmap
 
-- **0.1 (this spec)** — tier 2 + 4 only, single device, manual JWKS upload, GitHub OAuth bootstrap, Linux + macOS + Windows.
-- **0.2** — tier 1 (TPM, SE), tier 3 (KMS), posture claims, headless `--register-token`.
-- **0.3** — hosted registry (`registry.tapid.dev`), multi-device per user, admin CLI.
-- **0.4** — RFC 8693 token exchange, audit log streaming, MDM hooks (Jamf/Intune/Kandji), JWKS transparency log.
+- **0.1 — shipped.** Tier 4 (passphrase file) only, single device, manual JWKS upload (`--publish=manual`), GitHub Actions / Linux / macOS / Windows. Working `init` + `serve`.
+- **0.2 — shipped.** GitHub OAuth device-flow + Gist publish (`--publish=gist`), `republish` subcommand, encrypted GH token storage. Same passphrase secures both the device key and the GH OAuth token.
+- **0.3 — next.** Tier 1 hardware (Linux TPM 2.0 + Windows TBS) with ECDSA P-256 alongside Ed25519. macOS Secure Enclave deferred (cgo).
+- **0.4** — Tier 3 (KMS-wrapped), posture claims, headless `--register-token` for VPS bootstrap.
+- **0.5** — Hosted registry (`registry.tapid.dev`) opt-in, multi-device per user, admin CLI, JWKS rotation with dual-key overlap window.
+- **0.6** — RFC 8693 token exchange, audit log streaming, MDM hooks (Jamf/Intune/Kandji), JWKS transparency log.
 
 **Never:** secret storage, user authentication UI, authorization decisions.
 

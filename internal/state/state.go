@@ -21,16 +21,32 @@ type Device struct {
 	IssuerURL string    `json:"issuer_url"`
 	KeyTier   string    `json:"key_tier"`
 	CreatedAt time.Time `json:"created_at"`
+
+	// Publish mode: "manual" (user uploads JWKS) or "gist" (tapid manages a
+	// GitHub Gist). Empty = "manual" for backward compatibility.
+	PublishMode string `json:"publish_mode,omitempty"`
+
+	// Populated only when PublishMode == "gist".
+	GistID            string `json:"gist_id,omitempty"`
+	GistOwner         string `json:"gist_owner,omitempty"`
+	GistFileJWKS      string `json:"gist_file_jwks,omitempty"`
+	GistFileDiscovery string `json:"gist_file_discovery,omitempty"`
 }
 
-const deviceFile = "device.json"
-const keyFile = "key.enc"
+const (
+	deviceFile      = "device.json"
+	keyFile         = "key.enc"
+	githubTokenFile = "github.enc"
+)
 
 // DevicePath returns the device metadata path inside stateDir.
 func DevicePath(stateDir string) string { return filepath.Join(stateDir, deviceFile) }
 
 // KeyPath returns the encrypted key path inside stateDir.
 func KeyPath(stateDir string) string { return filepath.Join(stateDir, keyFile) }
+
+// GitHubTokenPath returns the encrypted GitHub OAuth token path inside stateDir.
+func GitHubTokenPath(stateDir string) string { return filepath.Join(stateDir, githubTokenFile) }
 
 // NewDeviceID returns a fresh device id: 6 base32-lowercased characters,
 // stable across restarts (caller persists). ~30 bits of entropy is enough
@@ -78,6 +94,9 @@ func Load(stateDir string) (Device, error) {
 	}
 	if d.DeviceID == "" || d.Kid == "" || d.IssuerURL == "" {
 		return d, errors.New("state: device.json missing required fields")
+	}
+	if d.PublishMode == "" {
+		d.PublishMode = "manual"
 	}
 	return d, nil
 }

@@ -8,14 +8,16 @@ import (
 
 // DiscoveryDoc is the OIDC discovery payload.
 type DiscoveryDoc struct {
-	Issuer                            string   `json:"issuer"`
-	JWKSURI                           string   `json:"jwks_uri"`
-	IDTokenSigningAlgValuesSupported  []string `json:"id_token_signing_alg_values_supported"`
-	ResponseTypesSupported            []string `json:"response_types_supported"`
-	SubjectTypesSupported             []string `json:"subject_types_supported"`
+	Issuer                           string   `json:"issuer"`
+	JWKSURI                          string   `json:"jwks_uri"`
+	IDTokenSigningAlgValuesSupported []string `json:"id_token_signing_alg_values_supported"`
+	ResponseTypesSupported           []string `json:"response_types_supported"`
+	SubjectTypesSupported            []string `json:"subject_types_supported"`
 }
 
-// Discovery returns the discovery doc for an issuer URL.
+// Discovery returns the discovery doc for an issuer URL with the default
+// jwks_uri (<issuer>/jwks.json). Override with WithJWKS for non-standard
+// hosting (e.g. gist publish where the JWKS is a sibling file, not a child).
 func Discovery(issuerURL string) DiscoveryDoc {
 	return DiscoveryDoc{
 		Issuer:                           issuerURL,
@@ -24,6 +26,12 @@ func Discovery(issuerURL string) DiscoveryDoc {
 		ResponseTypesSupported:           []string{"id_token"},
 		SubjectTypesSupported:            []string{"public"},
 	}
+}
+
+// WithJWKS overrides the jwks_uri. Returns the doc for chaining.
+func (d DiscoveryDoc) WithJWKS(jwksURL string) DiscoveryDoc {
+	d.JWKSURI = jwksURL
+	return d
 }
 
 // JWK is a single key entry.
